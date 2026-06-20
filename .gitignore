@@ -10,3 +10,4 @@ eval_results.json
 *.png
 *.pdf
 brief.md
+SMOKE_TEST.md
