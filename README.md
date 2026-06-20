@@ -60,6 +60,8 @@ To index a downloaded corpus directory:
 python rag.py ingest path\to\corpus
 ```
 
+On Windows, current Chroma builds require the Microsoft Visual C++ 2015-2022 x64 runtime. Gemini's free embedding tier also limits requests per minute, so ingestion uses batches of 90 with a 61-second pause. Paid-tier users can adjust `GEMINI_EMBEDDING_BATCH_SIZE` and `GEMINI_EMBEDDING_BATCH_PAUSE_SECONDS` in `.env`.
+
 ## How it works
 
 `PyPDFLoader` extracts text and zero-based page metadata; the application converts pages to human-readable one-based values. `RecursiveCharacterTextSplitter` makes 1,000-character chunks with 200-character overlap. `gemini-embedding-001` stores those chunks in a local persistent Chroma cosine index.
@@ -78,6 +80,17 @@ Optional labels in a JSONL question file add:
 - `expected_sources` for a basic retrieval-hit rate.
 
 The included example is deliberately unanswerable. Replace or extend it with the competition questions before reporting results. The judge is a pragmatic baseline metric, not proof of correctness; future work should use labeled retrieval and answer-correctness evaluation.
+
+## Verified smoke-test results
+
+Executed locally with Python 3.12.10 against `RegsNavyIV.pdf`:
+
+- ingestion: 99 pages, 262 chunks, persistent Chroma index created successfully;
+- answerable case: Amendment No. 82 was answered correctly with a citation to page 1;
+- unanswerable case: an Apple stock-price question returned the exact cannot-answer response with no sources;
+- two-row evaluation: groundedness `1.0`, answerable/unanswerable accuracy `1.0`, retrieval hit rate `1.0`.
+
+This is a functional smoke test, not a statistically meaningful quality claim. The competition question set should replace the two example rows for submission-level results.
 
 ## Tradeoffs
 
