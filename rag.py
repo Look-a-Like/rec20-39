@@ -9,18 +9,20 @@ import os
 import re
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
 from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyPDFLoader
+from langchain_core.embeddings import Embeddings
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
-UNANSWERABLE = "I cannot answer this based on the provided documents."
+UNANSWERABLE = "I cannot answer this based on the information provided. Please consult the seniority."
 COLLECTION_NAME = "procurement_policy"
 DEFAULT_INDEX = Path(".rag_index")
 
@@ -83,8 +85,55 @@ def embedding_model_name() -> str:
     return os.getenv("GEMINI_EMBEDDING_MODEL", "models/gemini-embedding-001")
 
 
-def embeddings() -> GoogleGenerativeAIEmbeddings:
-    return GoogleGenerativeAIEmbeddings(model=embedding_model_name())
+class RateLimitedGeminiEmbeddings(Embeddings):
+    """Batch Gemini document embeddings within the free-tier per-minute quota."""
+
+    def __init__(self) -> None:
+        self.client = GoogleGenerativeAIEmbeddings(model=embedding_model_name())
+        self.batch_size = int(os.getenv("GEMINI_EMBEDDING_BATCH_SIZE", "90"))
+        self.pause_seconds = float(
+            os.getenv("GEMINI_EMBEDDING_BATCH_PAUSE_SECONDS", "61")
+        )
+
+    def _embed_batch(self, batch: list[str]) -> list[list[float]]:
+        for attempt in range(2):
+            try:
+                return self.client.embed_documents(batch, batch_size=len(batch))
+            except Exception as error:
+                quota_error = "RESOURCE_EXHAUSTED" in str(error) or "429" in str(error)
+                if not quota_error or attempt == 1:
+                    raise
+                print(
+                    f"Embedding quota reached; retrying in {self.pause_seconds:.0f}s...",
+                    file=sys.stderr,
+                )
+                time.sleep(self.pause_seconds)
+        raise RuntimeError("Embedding retry loop ended unexpectedly.")
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if self.batch_size <= 0 or self.pause_seconds < 0:
+            raise ValueError("Embedding batch size must be positive and pause non-negative.")
+        results: list[list[float]] = []
+        batches = [
+            texts[index : index + self.batch_size]
+            for index in range(0, len(texts), self.batch_size)
+        ]
+        for position, batch in enumerate(batches):
+            results.extend(self._embed_batch(batch))
+            if position < len(batches) - 1:
+                print(
+                    f"Embedded {len(results)}/{len(texts)} chunks; "
+                    f"waiting {self.pause_seconds:.0f}s for quota reset..."
+                )
+                time.sleep(self.pause_seconds)
+        return results
+
+    def embed_query(self, text: str) -> list[float]:
+        return self.client.embed_query(text)
+
+
+def embeddings() -> Embeddings:
+    return RateLimitedGeminiEmbeddings()
 
 
 def chat_model(model: str | None = None) -> ChatGoogleGenerativeAI:
