@@ -22,7 +22,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmb
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
-UNANSWERABLE = "I cannot answer this based on the information provided. Please consult the seniority."
+UNANSWERABLE = "I cannot answer this based on the provided documents."
 COLLECTION_NAME = "procurement_policy"
 DEFAULT_INDEX = Path(".rag_index")
 
