@@ -1,4 +1,10 @@
 .env
+.python/
+.venv/
+.rag_index/
+__pycache__/
+*.py[cod]
+eval_results.json
 *.jpeg
 *.jpg
 *.png
