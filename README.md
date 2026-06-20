@@ -1,16 +1,31 @@
 # Plain-Vanilla RAG Baseline
 
-A small, runnable retrieval-augmented generation system for the supplied PDF corpus. It has explicit ingest, query, and evaluation commands and uses only retrieved text to answer.
+A runnable retrieval-augmented generation baseline for procurement and policy PDFs. The current code provides explicit ingest, query, citation, abstention, and evaluation commands. The revised plan below addresses the main retrieval and evaluation weaknesses discovered during review.
 
-## 40-minute implementation plan
+## Current status
 
-- **0-5 minutes — inspect:** confirm the corpus, deliverables, question formats, and available environment.
-- **5-15 minutes — ingest:** page-aware PDF loading, 1,000/200 chunking, Gemini embeddings, and a fresh local Chroma index.
-- **15-25 minutes — answer:** top-four retrieval, a strict context-only prompt, fixed abstention behavior, and verified source/page/chunk citations.
-- **25-32 minutes — evaluate:** JSONL runner plus LLM-as-a-judge groundedness; add retrieval-hit and abstention metrics when labels exist.
-- **32-40 minutes — harden and hand off:** CLI errors, interactive mode, dependency/env files, README, brief, and an end-to-end smoke test.
+The repository currently implements:
 
-If time compresses further, keep ingest, query, citation validation, and one grounding metric; defer OCR, reranking, hybrid search, and UI work.
+- page-aware PDF extraction;
+- recursive 1,000/200-character chunks;
+- Gemini embeddings in a persistent Chroma index;
+- top-four dense retrieval;
+- context-only generation with validated source/page/chunk citations;
+- a fixed cannot-answer response;
+- Gemini-based groundedness judging plus optional retrieval-hit and abstention metrics.
+
+This is the time-boxed baseline, not the final target design. In particular, citation validation proves that a cited label was retrieved; it does not prove that retrieval found the correct clause, year, or document version.
+
+## Revised 40-minute improvement plan
+
+- **0-5 minutes - establish tests:** create a small gold slice containing an exact clause ID, a date, a cross-document question, a superseded-policy conflict, and an unanswerable question.
+- **5-15 minutes - preserve structure:** detect headings and numbered clauses, attach `section_id` and section-title metadata, and use recursive character splitting only as a fallback for oversized sections.
+- **15-25 minutes - add hybrid retrieval:** combine BM25 lexical candidates with dense-vector candidates using reciprocal-rank fusion. Preserve exact identifier hits.
+- **25-31 minutes - diversify context:** retrieve a wider candidate pool, deduplicate it, cap repeated chunks from one document, and select six to eight passages when a question is cross-document.
+- **31-36 minutes - harden answers:** expose version/effective-date metadata, require both sides of a detected conflict, and abstain when the evidence does not establish the requested identifier or time scope.
+- **36-40 minutes - evaluate and report:** run the gold slice, record retrieval recall, citation correctness, abstention accuracy, and answer correctness, then document failures honestly.
+
+Under a hard deadline, the priority order is structure-aware chunks, hybrid retrieval, a small human-audited test set, and retrieval diversity. OCR, reranking, incremental indexing, and a second model provider follow afterward.
 
 ## Quick start
 
@@ -26,63 +41,72 @@ Copy-Item .env.example .env
 Add your key to `.env`, then run:
 
 ```powershell
-# 1. Extract, chunk, embed, and persist the local Chroma index
+# Build a fresh local index
 python rag.py ingest RegsNavyIV.pdf
 
-# 2. Ask one question
+# Ask one question
 python rag.py query "Your question here"
 
 # Or enter interactive mode
 python rag.py query
 
-# 3. Run the implemented evaluation metric
+# Run the implemented evaluation
 python rag.py evaluate eval_questions.example.jsonl --output eval_results.json
 ```
 
-To index a larger downloaded corpus, pass its directory:
+To index a directory of PDFs:
 
 ```powershell
 python rag.py ingest path\to\corpus
 ```
 
-Each ingest creates a fresh index, so reruns cannot silently duplicate or retain stale chunks.
+## How the current baseline works
 
-## How it works
+1. `PyPDFLoader` extracts text and page metadata.
+2. `RecursiveCharacterTextSplitter` creates 1,000-character chunks with 200-character overlap.
+3. `gemini-embedding-001` embeds chunks into a local Chroma cosine index.
+4. A query retrieves four dense-vector matches and sends only those passages to `gemini-2.5-flash`.
+5. The prompt requires context-supported claims and inline `[S1]` citations.
+6. Application code maps labels to file, page, and chunk ID and rejects missing or invented labels.
 
-1. `PyPDFLoader` extracts text and page metadata from every PDF.
-2. `RecursiveCharacterTextSplitter` makes 1,000-character chunks with 200-character overlap.
-3. `gemini-embedding-001` embeds chunks into a persistent local Chroma cosine index.
-4. A query retrieves the top four chunks and sends only those chunks to `gemini-2.5-flash`.
-5. The strict prompt permits only context-supported claims and requires inline `[S1]`-style citations.
-6. The program validates citation labels and maps them deterministically to file, page, and chunk ID. An uncited or invalidly cited answer is converted to the fixed cannot-answer response.
+The defaults can be changed with `--chunk-size`, `--overlap`, `-k`, or model settings in `.env`.
 
-The defaults can be changed with `--chunk-size`, `--overlap`, `-k`, or the model settings in `.env`.
+## Known limitations
 
-## Key choices
+- Character chunks can split numbered clauses, tables, and qualifiers.
+- Pure vector search can miss exact contract numbers, clause IDs, and dates.
+- Fixed `k=4` can overrepresent one document and miss cross-document evidence.
+- A valid citation can still point to a plausible but wrong year or policy version.
+- The generator and judge share a model family and therefore correlated blind spots.
+- Rebuilding the entire index is simple but inefficient for a large changing corpus.
+- The current index does not identify duplicates, superseded policies, or contradictions.
 
-- **Chunking: 1,000 / 200 characters.** Large enough to preserve a policy clause and nearby qualification; overlap reduces boundary loss.
-- **Retriever: cosine similarity, k=4.** A compact amount of relevant context keeps the prompt focused and inexpensive.
-- **Vector store: Chroma.** It is local, persistent, and needs no service or cloud account.
-- **Generation: temperature 0.** This favors stable, reproducible answers.
-- **Unanswerable handling.** The model must return exactly `I cannot answer this based on the provided documents.` when evidence is insufficient. Citation validation provides a second guardrail.
+## Revised target design
 
-## Evaluation
+### Structure-aware ingestion
 
-`evaluate` implements **LLM-as-a-judge groundedness**. For each JSONL question it checks whether every answer claim and citation is supported by the retrieved context, then reports `groundedness_pass_rate`.
+Detect section headings and identifiers such as `5.2.1(b)` and retain `document_id`, `section_id`, section title, page range, effective date, revision, and status where available. Keep a complete clause together when it fits; split only oversized sections with overlap. Citations should resolve to both section and page.
 
-Optional labels add two transparent diagnostics:
+### Hybrid and diverse retrieval
 
-- `expected_answerable` measures correct abstention behavior.
-- `expected_sources` measures whether at least one expected document appeared in the top-k retrieval.
+Run BM25 and vector retrieval in parallel, fuse their rankings, then deduplicate and diversify the candidate set. Lexical retrieval protects exact identifiers and dates; vector retrieval handles paraphrases. Cross-document questions should allow more context and apply a per-document cap rather than using a universal four-passage limit.
 
-Example row:
+### Version and contradiction handling
 
-```json
-{"question":"...","expected_answerable":true,"expected_sources":["RegsNavyIV.pdf"]}
-```
+Extract revision/effective-date metadata during ingestion. When retrieved passages disagree, present the conflict with both citations and their versions instead of silently selecting one. If version precedence cannot be established from metadata, say so.
 
-The included example is deliberately unanswerable. Replace or extend it with the provided competition questions for meaningful results. The judge is fast to add and directly tests grounding, but it is model-dependent; a labeled evaluation set with retrieval recall and answer correctness would be stronger.
+### Evaluation
 
-## Scope and next improvements
+Use a roughly 20-row human-audited gold set covering single facts, exact IDs, dates, cross-document synthesis, conflicting versions, and unanswerable questions. Report retrieval Recall@k or MRR separately from answer correctness, citation entailment, and abstention accuracy.
 
-This is intentionally a canonical baseline, not a production system. With more time: evaluate chunk size and k on labeled questions, add OCR for scanned PDFs, use hybrid lexical/vector retrieval, rerank candidates, cache embeddings, and add automated tests. See [brief.md](brief.md) for the complete rationale.
+The existing LLM judge remains a cheap diagnostic, not ground truth. Calibrate it against human labels and use a different model family when another provider is available.
+
+## Later reliability work
+
+- Maintain a content-hash manifest and update only changed documents.
+- Add OCR only for pages that fail extraction checks.
+- Rerank fused candidates if hybrid recall is good but ordering is weak.
+- Detect near-duplicate clauses and superseded documents.
+- Add automated regression tests for every audited failure.
+
+See [brief.md](brief.md) for the detailed reasoning and acceptance criteria.
