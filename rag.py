@@ -15,6 +15,7 @@ from typing import Any
 from dotenv import load_dotenv
 from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyPDFLoader
+from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -23,6 +24,26 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 UNANSWERABLE = "I cannot answer this based on the provided documents."
 COLLECTION_NAME = "procurement_policy"
 DEFAULT_INDEX = Path(".rag_index")
+
+NUMBERED_SECTION_RE = re.compile(
+    r"^(?P<section>(?:§\s*)?\d+(?:\.\d+)*(?:\([A-Za-z0-9]+\))*)[.)]?\s+"
+    r"(?P<title>[A-Z][\w ,;:/&'’()\-]{2,160})$"
+)
+NAMED_SECTION_RE = re.compile(
+    r"^(?P<section>(?:CHAPTER|SECTION|PART)\s+[A-Z0-9IVXLC]+)"
+    r"(?:\s*[-:.]\s*(?P<title>.+))?$",
+    re.IGNORECASE,
+)
+EFFECTIVE_DATE_RE = re.compile(
+    r"(?:effective|issued|dated)\s*(?:as\s+of|on)?\s*[:\-]?\s*"
+    r"(?P<date>[A-Z][a-z]+\s+\d{1,2},\s+\d{4}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+    re.IGNORECASE,
+)
+REVISION_RE = re.compile(
+    r"\b(?:revision|rev\.?|version|amendment)\s*[:#-]?\s*"
+    r"(?P<revision>[A-Za-z0-9][A-Za-z0-9.\- ]{0,30})",
+    re.IGNORECASE,
+)
 
 ANSWER_PROMPT = ChatPromptTemplate.from_messages(
     [
@@ -113,6 +134,109 @@ def display_path(path: Path) -> str:
         return path.name
 
 
+def document_attributes(text: str) -> dict[str, str]:
+    """Extract conservative document-level metadata used for citations and conflicts."""
+    effective = EFFECTIVE_DATE_RE.search(text)
+    revision = REVISION_RE.search(text)
+    lowered = text.lower()
+    if "rescinded" in lowered:
+        status = "rescinded"
+    elif "superseded" in lowered or "obsolete" in lowered:
+        status = "superseded"
+    else:
+        status = "unknown"
+    return {
+        "effective_date": effective.group("date") if effective else "unknown",
+        "revision": revision.group("revision").strip() if revision else "unknown",
+        "document_status": status,
+    }
+
+
+def heading_from_line(line: str) -> tuple[str, str] | None:
+    """Recognize the conservative heading forms common in policy PDFs."""
+    normalized = " ".join(line.split())
+    numbered = NUMBERED_SECTION_RE.match(normalized)
+    if numbered:
+        return numbered.group("section").replace("§ ", "§"), numbered.group("title")
+    named = NAMED_SECTION_RE.match(normalized)
+    if named:
+        return named.group("section").upper(), (named.group("title") or "").strip()
+    return None
+
+
+def section_documents(pdf: Path) -> tuple[list[Document], int]:
+    """Load a PDF into clause-aware documents, retaining page-range metadata."""
+    pages = PyPDFLoader(str(pdf)).load()
+    source = display_path(pdf)
+    attributes = document_attributes("\n".join(page.page_content for page in pages))
+    sections: list[Document] = []
+    current_lines: list[str] = []
+    current_pages: list[int] = []
+    section_id: str | None = None
+    section_title = ""
+
+    def flush() -> None:
+        nonlocal current_lines, current_pages
+        content = "\n".join(current_lines).strip()
+        if not content:
+            current_lines, current_pages = [], []
+            return
+        start_page = min(current_pages)
+        end_page = max(current_pages)
+        sections.append(
+            Document(
+                page_content=content,
+                metadata={
+                    "source": source,
+                    "page_number": start_page,
+                    "page_start": start_page,
+                    "page_end": end_page,
+                    "section_id": section_id or f"page-{start_page}",
+                    "section_title": section_title or f"Unheaded text on page {start_page}",
+                    **attributes,
+                },
+            )
+        )
+        current_lines, current_pages = [], []
+
+    for page in pages:
+        page_number = int(page.metadata.get("page", 0)) + 1
+        for raw_line in page.page_content.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            heading = heading_from_line(line)
+            if heading:
+                flush()
+                section_id, section_title = heading
+            current_lines.append(line)
+            current_pages.append(page_number)
+        if current_lines and current_pages[-1] != page_number:
+            current_pages.append(page_number)
+    flush()
+    return sections, len(pages)
+
+
+def split_sections(
+    sections: list[Document], chunk_size: int, overlap: int
+) -> list[Document]:
+    """Keep complete sections when possible and split only oversized sections."""
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=overlap,
+        add_start_index=True,
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
+    chunks: list[Document] = []
+    for section in sections:
+        if len(section.page_content) <= chunk_size:
+            section.metadata["start_index"] = 0
+            chunks.append(section)
+        else:
+            chunks.extend(splitter.split_documents([section]))
+    return chunks
+
+
 def reset_index(index_dir: Path) -> None:
     if not index_dir.exists():
         return
@@ -129,21 +253,14 @@ def ingest(inputs: list[str], index_dir: Path, chunk_size: int, overlap: int) ->
         raise SystemExit("Require chunk_size > 0 and 0 <= overlap < chunk_size.")
 
     pdfs = discover_pdfs(inputs)
-    pages = []
+    sections: list[Document] = []
+    page_count = 0
     for pdf in pdfs:
-        loaded_pages = PyPDFLoader(str(pdf)).load()
-        for page in loaded_pages:
-            page.metadata["source"] = display_path(pdf)
-            page.metadata["page_number"] = int(page.metadata.get("page", 0)) + 1
-        pages.extend(loaded_pages)
+        loaded_sections, pages = section_documents(pdf)
+        sections.extend(loaded_sections)
+        page_count += pages
 
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=overlap,
-        add_start_index=True,
-        separators=["\n\n", "\n", ". ", " ", ""],
-    )
-    chunks = splitter.split_documents(pages)
+    chunks = split_sections(sections, chunk_size, overlap)
     if not chunks:
         raise SystemExit("The PDFs contained no extractable text.")
 
@@ -173,7 +290,7 @@ def ingest(inputs: list[str], index_dir: Path, chunk_size: int, overlap: int) ->
     )
     print(
         f"Indexed {len(chunks)} chunks from {len(pdfs)} PDF(s) "
-        f"({len(pages)} pages) in {index_dir}."
+        f"({page_count} pages, {len(sections)} sections) in {index_dir}."
     )
 
 
@@ -200,6 +317,17 @@ def retrieve(store: Chroma, question: str, k: int) -> list[dict[str, Any]]:
                 "score": float(score),
                 "source": str(document.metadata.get("source", "unknown")),
                 "page": int(document.metadata.get("page_number", 0)),
+                "page_start": int(document.metadata.get("page_start", 0)),
+                "page_end": int(document.metadata.get("page_end", 0)),
+                "section_id": str(document.metadata.get("section_id", "unknown")),
+                "section_title": str(document.metadata.get("section_title", "")),
+                "effective_date": str(
+                    document.metadata.get("effective_date", "unknown")
+                ),
+                "revision": str(document.metadata.get("revision", "unknown")),
+                "document_status": str(
+                    document.metadata.get("document_status", "unknown")
+                ),
                 "chunk_id": str(document.metadata.get("chunk_id", "unknown")),
             }
         )
@@ -213,7 +341,11 @@ def format_context(passages: list[dict[str, Any]]) -> str:
     for passage in passages:
         header = (
             f"[{passage['label']}] source={passage['source']}; "
-            f"page={passage['page']}; chunk={passage['chunk_id']}"
+            f"section={passage['section_id']} ({passage['section_title']}); "
+            f"pages={passage['page_start']}-{passage['page_end']}; "
+            f"effective_date={passage['effective_date']}; "
+            f"revision={passage['revision']}; status={passage['document_status']}; "
+            f"chunk={passage['chunk_id']}"
         )
         sections.append(f"{header}\n{passage['text']}")
     return "\n\n".join(sections)
@@ -244,6 +376,13 @@ def answer_question(store: Chroma, question: str, k: int) -> dict[str, Any]:
             "label": passage["label"],
             "source": passage["source"],
             "page": passage["page"],
+            "page_start": passage["page_start"],
+            "page_end": passage["page_end"],
+            "section_id": passage["section_id"],
+            "section_title": passage["section_title"],
+            "effective_date": passage["effective_date"],
+            "revision": passage["revision"],
+            "document_status": passage["document_status"],
             "chunk_id": passage["chunk_id"],
             "relevance": round(passage["score"], 4),
         }
@@ -265,7 +404,9 @@ def print_result(result: dict[str, Any]) -> None:
         print("\nSources:")
         for source in result["sources"]:
             print(
-                f"[{source['label']}] {source['source']}, page {source['page']}, "
+                f"[{source['label']}] {source['source']}, section {source['section_id']}, "
+                f"pages {source['page_start']}-{source['page_end']}, "
+                f"revision {source['revision']}, status {source['document_status']}, "
                 f"chunk {source['chunk_id']} (relevance {source['relevance']:.4f})"
             )
 
